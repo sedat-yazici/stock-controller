@@ -1,0 +1,39 @@
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+session_cache.json
+
+# Excel and Data Files
+*.xlsx
+*.xls
+*.csv
+*.tsv
+
+# Binary & Icon Assets
+*.ico
+*.png
+software-agent.*
+
+# Python & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Build & Distribution Artifacts
+build/
+dist/
+*.spec
+*.egg-info/
+.eggs/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS Artifacts
+Thumbs.db
+.DS_Store
