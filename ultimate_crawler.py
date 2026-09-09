@@ -7,6 +7,7 @@ import requests
 import openpyxl
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
@@ -33,6 +34,7 @@ PASSWORD = os.getenv("PASSWORD", "")
 CACHE_FILE = os.getenv("SESSION_CACHE_FILE", "session_cache.json")
 OUTPUT_FILE = os.getenv("CATALOGUE_OUTPUT_PATH", "catalogue_export.xlsx")
 DELAY_BASE = float(os.getenv("REQUEST_DELAY_SECONDS", "0.5"))
+MAX_WORKERS = int(os.getenv("CRAWLER_CONCURRENCY", "8"))
 
 DEFAULT_HEADERS = {
     "User-Agent": os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
@@ -66,6 +68,39 @@ def polite_sleep(base_seconds):
         return
     jitter = random.uniform(0.7, 1.3)
     time.sleep(base_seconds * jitter)
+
+def convert_to_usd(amount, source_curr, rates):
+    """Converts price amount from source currency to USD using portal live exchange rates."""
+    if amount is None:
+        return None
+    source = str(source_curr or "USD").strip().upper()
+    if source == "TRY": source = "TL"
+    if source == "EURO": source = "EUR"
+    
+    if source == "USD":
+        return round(float(amount), 2)
+        
+    source_rate = rates.get(source, 1.0)
+    usd_rate = rates.get("USD", 1.0)
+    if usd_rate <= 0:
+        usd_rate = 1.0
+        
+    converted = (float(amount) * source_rate) / usd_rate
+    return round(converted, 2)
+
+def extract_exchange_rates(soup):
+    """Extracts live exchange rates from HTML root attributes (e.g. data-currency-rate-*)."""
+    rates = {"TL": 1.0, "KARMA": 1.0, "USD": 1.0, "EUR": 1.0}
+    html_tag = soup.find("html")
+    if html_tag:
+        for attr, val in html_tag.attrs.items():
+            if attr.startswith("data-currency-rate-"):
+                c_code = attr.replace("data-currency-rate-", "").upper()
+                try:
+                    rates[c_code] = float(str(val).replace(",", "."))
+                except ValueError:
+                    pass
+    return rates
 
 def safe_save_excel(wb, output_path):
     """Saves workbook safely, handling open file lock conflicts gracefully."""
@@ -133,16 +168,31 @@ def get_authenticated_session():
         
     return session
 
+def fetch_product_stock_code(session, url):
+    """Fetches a single product detail page and extracts the stock code (stok kodu)."""
+    try:
+        res = session.get(url, timeout=12)
+        if res.status_code == 200:
+            soup = BeautifulSoup(res.text, "html.parser")
+            # Selector: body > main > section > div > article > div.vs-product-facts > div:nth-child(1) > strong
+            strong_el = soup.select_one("div.vs-product-facts > div:nth-child(1) > strong") or soup.select_one(".vs-product-facts strong")
+            if strong_el:
+                return strong_el.get_text(strip=True)
+    except Exception:
+        pass
+    return "Bulunamadı"
+
 def extract_full_catalogue():
-    """Extracts all products from the paginated catalogue and saves to an Excel file."""
+    """Extracts all products, converts prices to USD, scrapes stock codes, and writes trimmed Excel report."""
     session = get_authenticated_session()
     
     products = []
     seen_urls = set()
+    portal_rates = {"TL": 1.0, "KARMA": 1.0, "USD": 1.0, "EUR": 1.0}
     page = 1
     max_retries = 3
     
-    log(f"\n[Crawl] Starting catalogue extraction from {BASE_URL}...")
+    log(f"\n[Phase 1] Crawling catalogue listing pages from {BASE_URL}...")
     start_time = time.time()
     
     while True:
@@ -159,17 +209,21 @@ def extract_full_catalogue():
                     log(f"[Crawl] Rate limited (HTTP 429) on page {page}. Sleeping {wait_time}s...")
                     time.sleep(wait_time)
                 else:
-                    log(f"[Crawl] HTTP {response.status_code} on page {page} (attempt {attempt}/{max_retries})")
                     time.sleep(attempt * 2)
             except Exception as e:
-                log(f"[Crawl] Request error on page {page} (attempt {attempt}/{max_retries}): {e}")
                 time.sleep(attempt * 2)
 
         if not response or response.status_code != 200:
-            log(f"[Crawl] Failed to retrieve page {page} after {max_retries} attempts. Stopping pagination.")
+            log(f"[Crawl] Finished catalogue traversal at page {page}.")
             break
             
         soup = BeautifulSoup(response.text, "html.parser")
+        
+        # Capture live exchange rates from HTML root tag
+        if page == 1:
+            portal_rates = extract_exchange_rates(soup)
+            log(f"[Currency] Portal conversion rates loaded: USD={portal_rates.get('USD', 1.0)}, EUR={portal_rates.get('EUR', 1.0)}")
+            
         cards = soup.find_all("article", class_="safir-product-card")
         if not cards:
             log(f"[Crawl] No product cards found on page {page}. Finished all available pages.")
@@ -187,71 +241,76 @@ def extract_full_catalogue():
                 continue
             seen_urls.add(link)
             
-            # Extract category & brand chips
-            chips = [s.get_text(strip=True) for s in card.select(".safir-card-chips span")]
-            category = chips[0] if len(chips) > 0 else ""
-            brand = chips[1] if len(chips) > 1 else ""
-            
-            # VAT rate from container data attribute
-            vat_rate = card.get("data-vs-kdv", "20")
-            
-            # Retail / Regular Price
-            reg_el = card.select_one(".safir-card-prices strong")
-            reg_price = safe_float(reg_el.get("data-vs-price-amount")) if reg_el else None
-            currency = reg_el.get("data-vs-price-currency", "USD") if reg_el else "USD"
-            
-            # Dealer Net Price (Excluding VAT)
-            net_el = card.select_one(".safir-dealer-net strong")
-            dealer_net = safe_float(net_el.get("data-vs-price-amount")) if net_el else None
-            
             # Dealer Price (Including VAT)
             dealer_el = card.select_one(".safir-card-dealer:not(.safir-dealer-net) strong")
-            dealer_price = safe_float(dealer_el.get("data-vs-price-amount")) if dealer_el else None
-            
-            # Discount rate tag (e.g. '%10 indirim')
-            rate_el = card.select_one(".safir-dealer-rate")
-            discount_rate = rate_el.get_text(strip=True) if rate_el else ""
-            
+            if dealer_el:
+                raw_dealer_price = safe_float(dealer_el.get("data-vs-price-amount"))
+                raw_currency = dealer_el.get("data-vs-price-currency", "USD")
+            else:
+                # Fallback to regular price if dealer price is absent
+                reg_el = card.select_one(".safir-card-prices strong")
+                raw_dealer_price = safe_float(reg_el.get("data-vs-price-amount")) if reg_el else None
+                raw_currency = reg_el.get("data-vs-price-currency", "USD") if reg_el else "USD"
+                
+            # Convert to USD using portal live rates
+            dealer_price_usd = convert_to_usd(raw_dealer_price, raw_currency, portal_rates)
             full_url = f"{BASE_URL}{link}" if link.startswith("/") else link
             
             products.append({
                 "title": title,
-                "category": category,
-                "brand": brand,
-                "regular_price": reg_price,
-                "dealer_net_price": dealer_net,
-                "dealer_price": dealer_price,
-                "currency": currency,
-                "vat_rate": vat_rate,
-                "discount_rate": discount_rate,
-                "url": full_url
+                "dealer_price_usd": dealer_price_usd,
+                "url": full_url,
+                "stock_code": None
             })
             page_products_count += 1
             
-        log(f"  [Page {page:02d}] Extracted {page_products_count} items (Total: {len(products)})")
+        log(f"  [Listing] Page {page:02d}: Extracted {page_products_count} products (Total: {len(products)})")
         page += 1
         polite_sleep(DELAY_BASE)
 
-    elapsed = time.time() - start_time
-    log(f"\n[Crawl] Crawling completed in {elapsed:.2f}s. Total items extracted: {len(products)}")
+    total_count = len(products)
+    log(f"\n[Phase 1 Complete] Found {total_count} products in {time.time() - start_time:.2f}s.")
+    
+    # Phase 2: Extract Stock Codes from individual product detail pages
+    log(f"\n[Phase 2] Fetching stock codes for {total_count} products via {MAX_WORKERS} concurrent worker threads...")
+    phase2_start = time.time()
+    
+    def worker_task(index, product_item):
+        stock_code = fetch_product_stock_code(session, product_item["url"])
+        return index, stock_code
 
-    # Create and format Excel workbook
+    completed_count = 0
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_map = {executor.submit(worker_task, idx, p): idx for idx, p in enumerate(products)}
+        for future in as_completed(future_map):
+            idx, code = future.result()
+            products[idx]["stock_code"] = code
+            completed_count += 1
+            if completed_count % 50 == 0 or completed_count == total_count:
+                log(f"  [Detail Progress] {completed_count}/{total_count} stock codes fetched ({completed_count / total_count * 100:.1f}%)")
+
+    log(f"[Phase 2 Complete] All stock codes extracted in {time.time() - phase2_start:.2f}s.")
+
+    # Phase 3: Create and format trimmed Excel workbook
+    log(f"\n[Phase 3] Generating Excel workbook: {OUTPUT_FILE}...")
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "Ürün Kataloğu"
+    ws.title = "Ürün Fiyat Listesi"
     ws.views.sheetView[0].showGridLines = True
     
+    # Required 4 columns
     headers = [
-        "Ürün Adı", "Kategori", "Marka", "Satış Fiyatı", 
-        "Bayi Fiyatı (KDV Hariç)", "Bayi Fiyatı (KDV Dahil)", 
-        "Para Birimi", "KDV Oranı (%)", "İskonto Oranı", "Ürün Linki"
+        "Ürün/Stok Kodu",
+        "Ürün Adı",
+        "Bayi Fiyatı (KDV Dahil)",
+        "Ürün Linki"
     ]
     ws.append(headers)
     
     # Header Styling
     header_fill = PatternFill(start_color="1E3D59", end_color="1E3D59", fill_type="solid")
     header_font = Font(name="Segoe UI", size=11, bold=True, color="FFFFFF")
-    header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    header_alignment = Alignment(horizontal="center", vertical="center")
     thin_border = Border(
         left=Side(style='thin', color='D3D3D3'),
         right=Side(style='thin', color='D3D3D3'),
@@ -267,41 +326,56 @@ def extract_full_catalogue():
         cell.border = thin_border
     ws.row_dimensions[1].height = 28
     
-    # Append Rows
+    # Append Trimmed Rows
+    data_font = Font(name="Segoe UI", size=10)
     for p in products:
         ws.append([
-            p["title"], p["category"], p["brand"], p["regular_price"],
-            p["dealer_net_price"], p["dealer_price"], p["currency"],
-            p["vat_rate"], p["discount_rate"], p["url"]
+            p["stock_code"],
+            p["title"],
+            p["dealer_price_usd"],
+            p["url"]
         ])
         
     # Format Data Rows
-    data_font = Font(name="Segoe UI", size=10)
     for row in range(2, ws.max_row + 1):
         ws.row_dimensions[row].height = 20
-        for col in range(1, len(headers) + 1):
-            cell = ws.cell(row=row, column=col)
-            cell.font = data_font
-            cell.border = thin_border
-            # Number formatting for prices
-            if col in [4, 5, 6] and isinstance(cell.value, (int, float)):
-                cell.number_format = '#,##0.00'
-                cell.alignment = Alignment(horizontal="right", vertical="center")
-            elif col in [7, 8, 9]:
-                cell.alignment = Alignment(horizontal="center", vertical="center")
-            else:
-                cell.alignment = Alignment(horizontal="left", vertical="center")
-                
+        # Stock code
+        c_code = ws.cell(row=row, column=1)
+        c_code.font = data_font
+        c_code.border = thin_border
+        c_code.alignment = Alignment(horizontal="center", vertical="center")
+        
+        # Product Title
+        c_title = ws.cell(row=row, column=2)
+        c_title.font = data_font
+        c_title.border = thin_border
+        c_title.alignment = Alignment(horizontal="left", vertical="center")
+        
+        # Dealer Price in USD
+        c_price = ws.cell(row=row, column=3)
+        c_price.font = data_font
+        c_price.border = thin_border
+        if isinstance(c_price.value, (int, float)):
+            c_price.number_format = '#,##0.00 "USD"'
+            c_price.alignment = Alignment(horizontal="right", vertical="center")
+        else:
+            c_price.alignment = Alignment(horizontal="center", vertical="center")
+            
+        # Product URL
+        c_url = ws.cell(row=row, column=4)
+        c_url.font = data_font
+        c_url.border = thin_border
+        c_url.alignment = Alignment(horizontal="left", vertical="center")
+        
     # Adjust Column Widths
-    for col in ws.columns:
-        col_letter = get_column_letter(col[0].column)
-        max_len = max(len(str(cell.value or '')) for cell in col)
-        ws.column_dimensions[col_letter].width = max(max_len + 4, 14)
-    ws.column_dimensions['A'].width = 45  # Ürün Adı
-    ws.column_dimensions['J'].width = 50  # URL
+    ws.column_dimensions['A'].width = 22  # Ürün/Stok Kodu
+    ws.column_dimensions['B'].width = 50  # Ürün Adı
+    ws.column_dimensions['C'].width = 26  # Bayi Fiyatı (KDV Dahil)
+    ws.column_dimensions['D'].width = 60  # Ürün Linki
     
     safe_save_excel(wb, OUTPUT_FILE)
-    log(f"[Done] Complete catalogue saved to: {OUTPUT_FILE}")
+    total_time = time.time() - start_time
+    log(f"\n[Done] Successfully processed {total_count} products and saved to '{OUTPUT_FILE}' in {total_time:.2f}s!")
 
 if __name__ == "__main__":
     extract_full_catalogue()
