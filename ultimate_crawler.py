@@ -168,19 +168,39 @@ def get_authenticated_session():
         
     return session
 
-def fetch_product_stock_code(session, url):
+def fetch_product_stock_code_and_description(session, url):
     """Fetches a single product detail page and extracts the stock code (stok kodu)."""
     try:
         res = session.get(url, timeout=12)
+        description = ""
         if res.status_code == 200:
             soup = BeautifulSoup(res.text, "html.parser")
-            # Selector: body > main > section > div > article > div.vs-product-facts > div:nth-child(1) > strong
+            # Select stock code
             strong_el = soup.select_one("div.vs-product-facts > div:nth-child(1) > strong") or soup.select_one(".vs-product-facts strong")
             if strong_el:
-                return strong_el.get_text(strip=True)
+                stock_code = strong_el.get_text(strip=True)
+                try:    
+                    # Select description panel
+                    desc_div = soup.find(id="product-description-panel")
+                    # Remove navigation bar
+                    nav_el = desc_div.find("nav")
+                    if nav_el:
+                        nav_el.decompose()
+                    # Remove wholesaler's contact info
+                    wholesaler_info = desc_div.find(id="09-toptan-fiyatlar-icin-nexpay360") or desc_div.find(id="nexpay360-guvencesi") or desc_div.find(id="nexpay360-satis-urun-bilgisi") or desc_div.find(id="nexpay360-satis-toptan-teklif")
+                    if wholesaler_info:
+                        for el in wholesaler_info.find_all_next():
+                            if el.parent == desc_div:
+                                el.decompose()
+                        wholesaler_info.decompose()
+
+                    description = desc_div.get_text()
+                except Exception as e:
+                    print(f"[Error] {stock_code} ürün açıklaması bulunamadı. Hata kodu: {e}")
+                return stock_code, description
     except Exception:
         pass
-    return "Bulunamadı"
+    return "Bulunamadı", description
 
 def extract_full_catalogue():
     """Extracts all products, converts prices to USD, scrapes stock codes, and writes trimmed Excel report."""
@@ -260,7 +280,8 @@ def extract_full_catalogue():
                 "title": title,
                 "dealer_price_usd": dealer_price_usd,
                 "url": full_url,
-                "stock_code": None
+                "stock_code": None,
+                "description": None
             })
             page_products_count += 1
             
@@ -276,15 +297,16 @@ def extract_full_catalogue():
     phase2_start = time.time()
     
     def worker_task(index, product_item):
-        stock_code = fetch_product_stock_code(session, product_item["url"])
-        return index, stock_code
+        stock_code, description = fetch_product_stock_code_and_description(session, product_item["url"])
+        return index, stock_code, description
 
     completed_count = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_map = {executor.submit(worker_task, idx, p): idx for idx, p in enumerate(products)}
         for future in as_completed(future_map):
-            idx, code = future.result()
+            idx, code, description = future.result()
             products[idx]["stock_code"] = code
+            products[idx]["description"] = description
             completed_count += 1
             if completed_count % 50 == 0 or completed_count == total_count:
                 log(f"  [Detail Progress] {completed_count}/{total_count} stock codes fetched ({completed_count / total_count * 100:.1f}%)")
@@ -303,7 +325,8 @@ def extract_full_catalogue():
         "Ürün/Stok Kodu",
         "Ürün Adı",
         "Bayi Fiyatı (KDV Dahil)",
-        "Ürün Linki"
+        "Ürün Linki",
+        "Toptancı Açıklaması"
     ]
     ws.append(headers)
     
@@ -333,7 +356,8 @@ def extract_full_catalogue():
             p["stock_code"],
             p["title"],
             p["dealer_price_usd"],
-            p["url"]
+            p["url"],
+            p["description"]
         ])
         
     # Format Data Rows
@@ -372,7 +396,7 @@ def extract_full_catalogue():
     ws.column_dimensions['B'].width = 50  # Ürün Adı
     ws.column_dimensions['C'].width = 26  # Bayi Fiyatı (KDV Dahil)
     ws.column_dimensions['D'].width = 60  # Ürün Linki
-    
+    ws.column_dimensions['E'].width = 100  # Toptancı Açıklaması
     safe_save_excel(wb, OUTPUT_FILE)
     total_time = time.time() - start_time
     log(f"\n[Done] Successfully processed {total_count} products and saved to '{OUTPUT_FILE}' in {total_time:.2f}s!")
